@@ -1,0 +1,7 @@
+# 启动
+linux121: start-dfs.sh	mr-jobhistory-daemon.sh start historyserver
+linux122: start-yarn.sh
+
+# 停止
+linux121: stop-dfs.sh	mr-jobhistory-daemon.sh stop historyserver
+linux122: stop-yarn.sh

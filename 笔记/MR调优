@@ -1,0 +1,294 @@
+# MR调优-Job执行的三原则
+
+## 1、Job执行三原则
+
+​	1、充分利用集群资源
+
+​	2、reduce阶段尽量放在一轮
+
+​	3、每个task的执行时间要合理
+
+### 充分利用集群资源
+
+​	JOb运行时，尽量让所有的节点都有任务处理，这样尽量保证集群资源被充分利用。
+
+​	reduce个数控制使用  mapreduce.job.reduces控制
+
+​	Map个数取决于使用哪种InputFormat， 默认的TextFileInputFormat根据block的个数来分配map数量(一个block一个map)
+
+### ReduceTask并发调整
+
+​	观察job如果大多数ReduceTask在第一轮运行完成后，剩下很少甚至一个ReduceTask刚开始运行。这种情况下，这个ReduceTask的执行时间将决定了该Job的运行时间，可以考虑将reduce个数减少。
+
+​	观察Job的执行情况，如果是MapTask运行完成后，只有个别节点在ReduceTask运行。需要增加ReduceTask并行度。
+
+### Task执行时间要合理
+
+​	一个job中，每个MapTask或ReduceTask的执行时间只有几秒钟，这意味着这个job的大部分时间都消耗在task的调度和进程启停上了，因此可以考虑增加每个task处理的数据大小。建议一个task处理时间为1分钟。
+
+# Shuffle调优
+
+## Map端调优
+
+### 判断Map内存使用
+
+ 	1、可以查看运行完成的job Counters中，对应的task是否发生过多次GC，以及GC时间占Task运行时间比。通常，**GC时间不应查过task运行时间的10%**，即是GC time elapsed(ms)/CPU time spent(ms)<10%
+
+​	![image-20210403101120854](.\图片\shuffle-Map优化.png)
+
+Map需要的内存还需要随着环形缓冲区的大小而对应调整。	
+
+​		mapreduce.map.memory.mb
+
+Map需要的CPU核数可以通过如下参数调整
+
+​		mapreduce.map.cpu.vcores
+
+**建议值**
+
+mapreduce.map.memory.mb=3G  
+
+mapreduce.map.cpu.vcores=1
+
+环形缓冲区
+
+​	mapreduce.task.io.sort.mb=512M
+
+​	mapreduce.task.io.factor =64   --溢写文件的合并，默认是10
+
+**Combiner** 
+
+​		不影响业务逻辑的时候，加上Combiner会提升性能。减少网络 IO。
+
+​		数据压缩， MapReduce中任务瓶颈一般都是IO。
+
+##  copy-阶段-数据压缩
+
+​	1、对Map的中间结果进行压缩，当数据量大时，会显著减少网络传输的数据量
+
+​	2、但是也因为多了压缩和解压，带来更多的CPU消耗。因此要做好权衡。当任务属于网络瓶颈类型时，压缩Map中间结果效果明显。
+
+​	3、**在实际经验中，hadoop的运行瓶颈一般都是IO而不是CPU，压缩一般可以10的减少IO操作**
+
+## Reduce调优
+
+​	mapreduce.reduce.memory.mb=5G
+
+​	mapreduce.reduce.cpu.vcores=1	
+
+默认是1G和1 core。
+
+ 	聚合统计分析 5G+1C
+
+​	**拉取shuffle数据，默认是5个并行度，推荐50-100个并行度**
+
+​		mapreduce.reduce.shuflle.paralleIcopies参数，并行度拷贝数据。
+
+### 溢写归并
+
+​	**ReduceTask的内存缓冲区大小调整**
+
+​		 Copy过来的数据会先放入内存缓冲区中，然后当使用内存达到一定量的时候spill磁盘。基于JVM的heap size设置。通过下面参数控制。
+
+​			 mapreduce.reduce.shuffle.input.buffer.percent 默认是0.7
+
+​		shuflle在reduce内存中的数据最多使用内存量为：0.7*max Heap of reduce task，内存到磁盘的merge的启动可以通过
+
+​			mapreduce.reduce.shuffle.merge.percent 配置， 默认是0.6
+
+​		copy完成后，reduce会进行归并排序阶段，合并因子默认是10			
+
+```sh
+mapreduce.reduce.shuffle.parallecopies  # 复制数据的并行度，默认是5，建议调整为50-100
+mapreduce.task.io.sort.factor   # 一次合并文件的个数，默认是10，建议调整为64
+mapreduce.reduce.shuffle.input.buffer.percent  # 在shuffle的复制阶段，分配给Reduce输出缓冲区占堆内存的百分比，默认是0.7
+mapreduce.reduce.shuffle.merge.percent  # 输出缓冲区的阈值，用于启动合并输出和磁盘溢写的过程
+```
+
+# shuffle调优-推测执行-小文件优化
+
+## 推测执行
+
+​	mapreduce.map.speculative=true
+
+​	mapreduce.reduce.speculative=true
+
+建议
+
+​	大型集群开启，小集群关闭，10个以内的节点。
+
+​	集群的推测执行都是关闭的，在需要推测执行的作业开启。
+
+## Slow Start
+
+​	MapReduce的AM在申请资源的时候，会一次性申请所有的Map资源，延后申请reduce的资源，这样就能达到先执行完大部分Map在执行Reduce的目的。
+
+​			**mapreduce.job.reduce.slowstart.completedmaps**
+
+​	当多少占比的Map执行完成后开始执行Reduce。默认5%的Map跑完后，开始起 Reduce。
+
+​	如果想要Map完全结束后执行Reduce调整该值为1。
+
+
+
+## 小文件优化
+
+​	1、从源头解决小文件，不在HDFS上存储小文件，上传到HDFS合并小文件
+
+​	2、通过MR程序合并HDFS上已经存在的小文件
+
+​	3、MR计算的时候可以通过CombineTextInputFormat来降低MapTask并行度
+
+# 数据倾斜
+
+​	1、数据倾斜，每个Reduce处理的数据量不是同一个级别的，所有数据量少的Task已经跑完了，数据量大的Task则需要更多时间
+
+​	2、有可能就是某些作业所在的NodeManager有问题或者Container有问题，导致作业执行缓慢
+
+**解决办法**
+
+​	1、自定义分区实现逻辑
+
+​	2、修改分区的键，让其如何Hash分区，比如在key前加随机数n-key
+
+​	3、抽取导致倾斜的key对应的数据单独处理。
+
+​	4、若是节点服务问题造成某些map和reduce执行缓慢，可以使用推测执行。
+
+
+
+# Yarn调优
+
+## NM配置
+
+​	**可用内存**
+
+​	抛出分配给操作系统、其他服务的内存外，剩余的资源应尽量分配给YARN。
+
+​	yarn.nodemanager.resouce.memory-mb ，默认是8192
+
+​	**CPU虚拟核数**
+
+​	建议将此配置设定在逻辑核数的1.5-2倍之间。如果CPU的计算能力要求不高，可以配置为2倍的逻辑CPU。
+
+​	yarn.nodemanager.resource.cpu-vcores		默认是8
+
+## Container启动模式
+
+​	Yarn的NodeManager提供两种Container的启动模式。
+
+​	默认，YARN为每一个Container启动一个JVM，JVM进程间不能实现资源共享，导致资源本地化的开销比较大。针对启动时间较长的问题，新增了基于线程池本地化启动模式，能够有效提升Container启动效率。
+
+​	yarn.nodemanager.container-executor.class
+
+​		设置为org.apache.hadoop.yarn.server.nodemanager.DefaultContainerExecutor，每次启动Container将会启动一个线程来实现资源本地化。
+
+​		设置为org.apache.hadoop.yarn.server.nodemanager.LinuxContainerExecutor，每次启动Container都会启动一个JVM进程来实现资源本地化，该模式启动时间较长，但可以提供较好的资源（CPU、内存）隔离能力。
+
+## AM调优
+
+​	运行的一个大任务，Task总数达到几百或者上千的规模，这时候任务会失败，原因是AM反应缓慢，最终超时失败。
+
+​	建议：		
+
+​		任务数量多时增大AM内存，调整到10G左右。
+
+​	yarn.app.mapreduce.am.resource.mb
+
+# NameNode-FullGC的影响
+
+​	JVM堆内存
+
+​	![image-20210403181442258](.\图片\JVM内存模型】.png)
+
+
+
+​	full GC只会有GC进程工作。
+
+​	JVM内存划分为堆内存和永久代（堆外内存），JDK1.8以后称为元空间：MetaSpace，由操作系统管理。
+
+​	
+
+​	对象流程：
+
+​		Eden->  Minot GC -> S0（FromSpace）-> Minot GC -> S1（ToSpace） -> oldGen
+
+![image-20210403184444358](.\图片\对象的JVM流程.png)
+
+# NameNode-FullGC日志分析
+
+​	jstat -gc  -t 67998   1s  监听进程号67998，没s刷新一次		
+
+```
+jstat  -gc -t 58563 1s  #显示pid是58563的垃圾回收堆的行为统计
+Timestamp    S0C  S1C  S0U  S1U   EC    EU    OC     OU   MC   MU  CCSC  CCSU  YGC   YGCT  FGC  FGCT   GCT 
+9751.8 12288.0 12288.0  0.0   0.0  158208.0  8783.6  54272.0  23264.6  35496.0 34743.9 4144.0 3931.8  9   0.231  2  0.123 0.354
+9752.8 12288.0 12288.0  0.0   0.0  158208.0  8783.6  54272.0  23264.6  35496.0 34743.9 4144.0 3931.8  9   0.231  2  0.123 0.354
+
+#C即Capacity 总容量，U即Used 已使用的容量
+S0C: 当前survivor0区容量（kB）。
+S1C: 当前survivor1区容量（kB）。
+S0U: survivor0区已使用的容量（KB）
+S1U: survivor1区已使用的容量（KB）
+开启HDFS GC详细日志输出
+编辑hadoop-env.sh
+增加JMX配置打印详细GC信息
+指定一个日志输出目录；注释掉之前的ops
+增加新的打印配置
+EC: Eden区的总容量（KB） 
+EU: 当前Eden区已使用的容量（KB）
+OC: Old空间容量（kB）。
+OU: Old区已使用的容量（KB）
+MC: Metaspace空间容量（KB）
+MU: Metacspace使用量（KB）
+CCSC: 压缩类空间容量（kB）。
+CCSU: 压缩类空间使用（kB）。
+YGC: 新生代垃圾回收次数
+YGCT: 新生代垃圾回收时间
+FGC: 老年代 full GC垃圾回收次数
+FGCT: 老年代垃圾回收时间
+GCT: 垃圾回收总消耗时间
+```
+
+
+
+```
+export NAMENODE_OPTS="-verbose:gc -XX:+PrintGCDetails -Xloggc:${HADOOP_LOG_DIR}/logs/hadoop-gc.log \
+-XX:+PrintGCDateStamps -XX:+PrintGCApplicationConcurrentTime -XX:+PrintGCApplicationStoppedTime \
+-server -Xms150g -Xmx150g -Xmn20g -XX:SurvivorRatio=8 -XX:MaxTenuringThreshold=15 \
+-XX:ParallelGCThreads=18 -XX:+UseConcMarkSweepGC -XX:+UseParNewGC -XX:+UseCMSCompactAtFullCollection -XX:+DisableExplicitGC -XX:+CMSParallelRemarkEnabled \
+-XX:+CMSClassUnloadingEnabled -XX:CMSInitiatingOccupancyFraction=70 -XX:+UseFastAccessorMethods -X:+UseCMSInitiatingOccupancyOnly -XX:CMSMaxAbortablePrecleanTime=5000   \
+-XX:+UseGCLogFileRotation -XX:GCLogFileSize=20m -XX:ErrorFile=${HADOOP_LOG_DIR}/logs/hs_err.log.%p -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${HADOOP_LOG_DIR}/logs/%p.hprof \
+"
+
+-Xms150g -Xmx150g：堆内存大小最大和最小都是150G
+-Xmn20g：新生代大小是20g，等于eden+2*survivor，意味着，老年代为150-20=130G
+-XX:SurvivorRatio=8 ：Eden和suvivor的大小比值为8，意味着两个survivor区和一个Eden区的比值为1:8，一个survivor占整个年轻代的1/10
+-XX:ParallelGCThreads=18：设置ParNew GC线程并行数，默认为8+（runtime,availableProcessors-8)*5/8，24核机器为18.
+-XX:MaxTenuringThreshold=15 ：经历过多少次GC依然存活的对象，可以进入老年代
+XX:+UseConcMarkSweepGC：垃圾收集器 CMS，老年代使用CMS GC。
+-XX:+UseParNewGC：设置新生代使用Parallel New GC
+
+```
+
+​	
+
+​	HDFS的NameNode的对象都是大文件，目录和blocks。这些数据只要不被程序或者数据的用友者认为的删除。就会在NameNode的运行周期内一直存在，所以这些对象通常都存在old区中。
+
+​	![image-20210403191803765](.\图片\NameNode的内存推荐.png)
+
+​	使用低卡顿的G1收集器。	
+
+```
+export HADOOP_NAMENODE_OPTS="-server -Xmx220G -Xms200G -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+ParallelRefProcEnabled -XX:-ResizePLAB -XX:+PerfDisableSharedMem -XX:-OmitStackTraceInFastThrow -XX:G1NewSizePercent=2 -X:ParallelGCThreads=23 -XX:InitiatingHeapOccupancyPercent=40 -XX:G1HeapRegionSize=32M -XX:G1HeapWastePercent=10 -X:G1MixedGCCountTarget=16 -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCTimeStamps -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=5 -XX:GCLogFileSize=100M -Xloggc:/var/log/hbase/gc.log -hadoop.security.logger=${HADOOP_SECURITY_LOGGER:-INFO,RFAS} -Dhdfs.audit.logger=${HDFS_AUDIT_LOGGER:-INFO,NullAppender} $HADOOP_NAMENODE_OPTS"
+```
+
+​	
+
+# 二次开发环境搭建
+
+
+
+
+
+​	

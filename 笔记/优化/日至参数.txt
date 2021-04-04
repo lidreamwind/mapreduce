@@ -1,0 +1,2 @@
+xasecure.audit.destination.hdfs.batch.filespool.dir
+xasecure.audit.destination.solr.batch.filespool.dir

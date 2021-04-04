@@ -1,0 +1,438 @@
+# Reduce-Join需求分析
+
+## 需求分析
+
+投递行为数据表deliver_info:
+
+| UserId | positionId | date       |
+| ------ | ---------- | ---------- |
+| 1001   | 177725422  | 2021-01-03 |
+| 1002   | 177725422  | 2021-01-04 |
+| 1003   | 177725433  | 2021-01-03 |
+
+职位表position
+
+| id        | positionName     |
+| --------- | ---------------- |
+| 177725422 | 产品经理         |
+| 177725433 | 大数据开发工程师 |
+
+**补充投递行为中对应的职位名称。**
+
+设计Mapper输出
+
+​	key:positionId
+
+​	value: bean
+
+如何判断读取的是哪个文件的数据？
+
+通过在Mapper中重写setup，通过获取切片信息获取正在读取的文件信息。
+
+## 代码实现
+
+### Bean
+
+```java
+package com.lagou.writable.reducerJoin;
+
+import org.apache.hadoop.io.Writable;
+
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+
+public class ReduceJoinBean implements Writable {
+    //定义属性信息
+    private String userId;
+    private String positionId;
+    private String date;
+    private String positionName;
+    //flag判断数据来自哪个,这个应该不是非常必要，在Reduce阶段可以通过HashMap完成
+    private String flag;
+    //反序列化方法需要无参构造
+    public ReduceJoinBean() {
+    }
+
+    /**
+     * Serialize the fields of this object to <code>out</code>.
+     *
+     * @param out <code>DataOuput</code> to serialize this object into.
+     * @throws IOException
+     */
+    @Override
+    public void write(DataOutput out) throws IOException {
+        out.writeUTF(this.userId);
+        out.writeUTF(this.positionId);
+        out.writeUTF(this.date);
+        out.writeUTF(positionName);
+        out.writeUTF(flag);
+    }
+
+    /**
+     * Deserialize the fields of this object from <code>in</code>.
+     *
+     * <p>For efficiency, implementations should attempt to re-use storage in the
+     * existing object where possible.</p>
+     *
+     * @param in <code>DataInput</code> to deseriablize this object from.
+     * @throws IOException
+     */
+    @Override
+    public void readFields(DataInput in) throws IOException {
+        this.userId=in.readUTF();
+        this.positionId = in.readUTF();
+        this.date = in.readUTF();
+        this.positionName = in.readUTF();
+        this.flag = in.readUTF();
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
+    public String getPositionId() {
+        return positionId;
+    }
+
+    public void setPositionId(String positionId) {
+        this.positionId = positionId;
+    }
+
+    public String getDate() {
+        return date;
+    }
+
+    public void setDate(String date) {
+        this.date = date;
+    }
+
+    public String getPositionName() {
+        return positionName;
+    }
+
+    public void setPositionName(String positionName) {
+        this.positionName = positionName;
+    }
+
+    public String getFlag() {
+        return flag;
+    }
+
+    public void setFlag(String flag) {
+        this.flag = flag;
+    }
+
+    // 格式化输出
+    @Override
+    public String toString() {
+        return "userId=" + userId +
+                "\t positionId=" + positionId +
+                "\t date=" + date +
+                "\t positionName=" + positionName+
+                "\t flag=" + flag;
+    }
+}
+```
+
+### Reduce
+
+```java
+package com.lagou.writable.reducerJoin;
+
+import org.apache.commons.beanutils.BeanUtils;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Reducer;
+
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
+
+public class ReduceJoinReducer extends Reducer<Text,ReduceJoinBean,ReduceJoinBean, NullWritable> {
+    /**
+     * This method is called once for each key. Most applications will define
+     * their reduce class by overriding this method. The default implementation
+     * is an identity function.
+     *
+     * @param key
+     * @param values
+     * @param context
+     */
+    @Override
+    protected void reduce(Text key, Iterable<ReduceJoinBean> values, Context context) throws IOException, InterruptedException {
+        //根据key -postitionId做key的划分，那么迭代的将是diliver和position
+        // deliver列表
+        ArrayList<ReduceJoinBean> deliverBeans = new ArrayList<>();
+        // 职位只会有一个
+        ReduceJoinBean positionBean = new ReduceJoinBean();
+        for (ReduceJoinBean value : values) {
+            ReduceJoinBean tempBean = new ReduceJoinBean();
+            if(value.getFlag().equals("deliver")){
+                //此处不能直接把bean对象添加到debeans中，需要深度拷贝才行
+                try {
+                    BeanUtils.copyProperties(tempBean,value);
+                } catch (IllegalAccessException e) {
+                    e.printStackTrace();
+                } catch (InvocationTargetException e) {
+                    e.printStackTrace();
+                }
+                deliverBeans.add(tempBean);
+            }else {
+                try {
+                    BeanUtils.copyProperties(positionBean,value);
+                } catch (IllegalAccessException e) {
+                    e.printStackTrace();
+                } catch (InvocationTargetException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+        for (ReduceJoinBean deliverBean : deliverBeans) {
+            deliverBean.setPositionName(positionBean.getPositionName());
+            context.write(deliverBean,NullWritable.get());
+        }
+    }
+}
+```
+
+### Map
+
+```java
+package com.lagou.writable.reducerJoin;
+
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.InputSplit;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileSplit;
+
+import java.io.IOException;
+
+//通过positionId将两张表的数据聚集在一起，Text就是positionId， ReduceJoinBean是相关数据
+public class ReduceJoinMapper extends Mapper<LongWritable, Text,Text, ReduceJoinBean> {
+    String textName = "";
+    /**
+     * Called once at the beginning of the task.
+     * 通过setup获取文件的名字
+     *
+     * @param context
+     */
+    @Override
+    protected void setup(Context context) throws IOException, InterruptedException {
+        InputSplit inputSplit = context.getInputSplit();
+        FileSplit fileSplit = (FileSplit)inputSplit;
+        textName = fileSplit.getPath().getName();
+    }
+
+    /**
+     * Called once for each key/value pair in the input split. Most applications
+     * should override this, but the default is the identity function.
+     *
+     * @param key
+     * @param value
+     * @param context
+     */
+    @Override
+    protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+        String[] fiedls = value.toString().split("\t");
+        ReduceJoinBean bean = new ReduceJoinBean();
+        if(textName.startsWith("deliver_info")){
+            bean.setDate(fiedls[2]);
+            bean.setFlag("deliver");
+            bean.setPositionId(fiedls[1]);
+            bean.setUserId(fiedls[0]);
+            bean.setPositionName("");
+        }else{
+            bean.setDate("");
+            bean.setFlag("position");
+            bean.setPositionName(fiedls[1]);
+            bean.setPositionId(fiedls[0]);
+            bean.setUserId("");
+        }
+        Text text = new Text();
+        text.set(bean.getPositionId());
+        context.write(text,bean);
+    }
+}
+```
+
+### Job-Driver
+
+```java
+package com.lagou.writable.reducerJoin;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+
+import java.io.IOException;
+
+public class ReduceJoinJob {
+    public static void main(String[] args) throws IOException, ClassNotFoundException, InterruptedException {
+        Configuration conf = new Configuration();
+        Job job = Job.getInstance(conf, "ReduceJoin");
+
+        job.setJarByClass(ReduceJoinJob.class);
+        job.setMapperClass(ReduceJoinMapper.class);
+        job.setReducerClass(ReduceJoinReducer.class);
+
+        job.setMapOutputKeyClass(Text.class);
+        job.setMapOutputValueClass(ReduceJoinBean.class);
+
+        job.setOutputKeyClass(ReduceJoinBean.class);
+        job.setOutputValueClass(NullWritable.class);
+
+
+//        FileInputFormat.setInputPaths(job, new Path(args[0])); //指定读取数据的原始路径
+        FileInputFormat.setInputPaths(job, new Path("E:\\data\\input\\MRjoin\\reduce_join\\input")); //指定读取数据的原始路径
+//        7. 指定job输出结果路径
+//        FileOutputFormat.setOutputPath(job, new Path(args[1])); //指定结果数据输出路径
+        FileOutputFormat.setOutputPath(job, new Path("E:\\data\\output\\reduce_join\\output")); //指定结果数据输出路径
+//        8. 提交作业
+        final boolean flag = job.waitForCompletion(true);
+        //jvm退出：正常退出0，非0值则是错误退出
+        System.exit(flag ? 0 : 1);
+    }
+}
+```
+
+## 优缺点
+
+**缺点**
+
+- ​	数据聚合功能是在reduce端完成，reduce端并行度一般不高。所以执行效率存在隐患
+
+- ​	相同positionid的数据去往同一个分区，数据本身存在不平衡，会造成大数据中非常常见的**数据倾斜**
+
+  解决方式：可以使用map端Join
+
+# Map-Join
+
+## 需求分析
+
+适用于关联表中有小表的情形。
+
+可以将小表分发到所有的map节点，这样map节点就可以在本地对自己所读到的大表数据进行Join并输出最终结果，可以大大提高Join操作的并发度，加快数据处理速度。
+
+## 代码实现
+
+在Mapper的setup阶段，将文件读取到缓存集合中。
+
+在驱动函数中加载缓存。
+
+
+
+# 数据倾斜解决方案
+
+**通用解决方案**
+
+​	对key增加随机数
+
+​	以Mr为例
+
+​			 	第一个阶段，对key增加随机数
+
+​				第二个阶段，去掉key的随机数
+
+
+
+# GroupingComparator
+
+控制mr中reduce中作为一组数据调用一次reduce逻辑，shuffle过程中的自定义分组方式。
+
+
+
+# InputFormat
+
+inputFormat常见子类
+
+​	TextInputFormat（普通文本文件，MR框架默认实现的读取实现类型
+
+​	KeyValueTextInputFormat（读取一行文本，指定第一个字段为key
+
+​	NLineInputFormat（读取数据按照行切分分片
+
+​	CombineTextInputFormat（合并小文件，将小文件合并为一个mapTask，避免启动过多MapTask任务
+
+​	自定义InputFormat
+
+
+
+## CombineTextInputFormat 案例
+
+​	从逻辑上将多个小文件从逻辑上划分成一个切片。
+
+​	job.setInputFormatClass(CombineTextInputFormat.class)		//设置InputFormat类型
+
+​	CombineInputFormat.setMaxInputSplitSize(job, 4194304)  // 虚拟存储切片的最大值，默认是byte
+
+
+
+​	切片生成过程分为两部分，虚拟存储过程和切片过程。
+
+![image-20210330212723485](.\图片\CombineInputFormat虚拟存储过程.png)
+
+​	![image-20210330212900063](.\图片\虚拟存储切片.png)
+
+## 自定义InputFormat
+
+HDFS还是MapReduce，在处理小文件时效率都非常低。可以定义InputFormat实现小文件的合并。
+
+**需求**
+
+将多个小文件合成一个SequenceFile文件（SequenceFile是Hadoop用来存储二进制形式的key-value对的文件格式）
+
+SequenceFile里面存储着多个文件，存储的形式为文件路径+名称为key，文件内容为value。
+
+**整体思路**
+
+1. ​	定义一个类继承FileInputFormat，TextFileInputFormat的父类。
+2. 重写isSplitable（）指定为不可切分；重写createRecordReader（）方法，创建RecordReader对象，
+3. 改变默认读取数据方式，实现一次读取一个完整文件作为kv输出；
+4. Driver指定使用的InputFormat类型
+
+
+
+# OutputFormat
+
+OutputFormat是MapReduce输出数据的基类，所有MapReduce的数据输出都实现了OutputFormat抽象类。
+
+​	TextOutputForMat默认格式是TextOutputformat，把每条记录写为文本行。他的键和值可以是任意类型，因为TextOutputFormat调用tostring方法把他们转换为字符串。
+
+​	SequenceFileOutputFormat，输出作为后续MapReduce任务的输入。格式进奏，容易压缩。
+
+## 自定义OutputFormat
+
+**需求分析**
+
+需要在mr程序中根据数据的不同输出两类结果到不同目录，这类需求可以通过自定义OutputFormat来实现。
+
+**实现步骤**
+
+1. 自定义一个类继承FileOutputFormat
+2. 改写RecordWriter，改成输出数据的方法write
+3. ![image-20210330222017651](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20210330222017651.png)
+
+
+
+
+
+
+
+# shuffle阶段的压缩机制
+
+hadoop支持的压缩格式
+
+![image-20210330224742640](.\图片\hadoop压缩格式.png)
+
+![image-20210330224823160](.\图片\压缩解码器和压缩比.png)
+
